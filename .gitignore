@@ -1,0 +1,17 @@
+.DS_Store
+__pycache__/
+*.pyc
+
+# katta / uchinchi tomon fayllari (README: "Repoda nima yo'q")
+VideoMontaj/modellar/*.bin
+VideoMontaj/styles/*/referens/**
+!VideoMontaj/styles/*/referens/*.py
+!VideoMontaj/styles/*/referens/*.sh
+VideoMontaj/assets/ovoz/*.mp3
+VideoMontaj/assets/ovoz/asl/
+VideoMontaj/assets/musiqa/*.mp3
+VideoMontaj/videos/*/assets/*.mp4
+VideoMontaj/videos/*/assets/*.mp3
+VideoMontaj/videos/*/assets/sfx/
+VideoMontaj/videos/*/renders/
+VideoMontaj/ish/

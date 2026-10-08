@@ -1,0 +1,1618 @@
+<!doctype html>
+<html lang="uz">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=1080, height=1920" />
+    <title>C0038 — 500 dollar (Green Minimal, premium)</title>
+    <script src="https://cdn.jsdelivr.net/npm/gsap@3.14.2/dist/gsap.min.js"></script>
+<script>
+  (function () {
+    /* SHUTTER_SNIPPET_START */
+    if (!window._hfMbUid) window._hfMbUid = 0;
+    if (!window._hfMbAttached) window._hfMbAttached = new WeakSet();
+    if (!window._hfMbSkipped) window._hfMbSkipped = new WeakSet();
+    if (!window._hfMbProxies) window._hfMbProxies = new WeakSet();
+    if (!window._hfMbTimeline) window._hfMbTimeline = new WeakMap();
+    if (!window._hfMbWarned) window._hfMbWarned = new WeakSet();
+
+    // The declarative form. A copy of a target must not carry it, or the copy is swept
+    // as a target of its own; the group's own marker is `data-hf-motion-blur-group`.
+    var SWEEP_ATTR = "data-hf-motion-blur";
+    // About eight seconds. Long enough for an asynchronously mounted sub-composition, short
+    // enough that a page with a genuine mistake in it reports before anyone stops watching.
+    var POLL_MS = 32;
+    var POLL_TICKS = 250;
+    var SWEEP_SELECTOR = "[" + SWEEP_ATTR + "]";
+    var OPTION_KEYS = ["shutterAngle", "shutterPhase", "samplesPerFrame", "fps"];
+
+    // A copy is a deep clone, so the attribute rides along on the root AND on every marked
+    // descendant. Any one left behind is swept as a target of its own, which clones again.
+    var COPY_STRIP = [SWEEP_ATTR, "data-composition-id", "data-fps"];
+
+    function stripAttrs(el) {
+      for (var a = 0; a < COPY_STRIP.length; a++) el.removeAttribute(COPY_STRIP[a]);
+    }
+
+    function stripCopyAttrs(root) {
+      stripAttrs(root);
+      var inner = root.querySelectorAll("[" + COPY_STRIP.join("],[") + "]");
+      for (var i = 0; i < inner.length; i++) stripAttrs(inner[i]);
+    }
+
+    // Shutter length is measured in frames, so the snippet must know the composition
+    // frame rate: explicit option, else the target's OWN root, else the first root in
+    // the document, else 30. The target's root is what makes two compositions on one
+    // page read their own data-fps instead of sharing the first one written.
+    function resolveFps(optionFps, target) {
+      var explicit = Number(optionFps);
+      if (explicit > 0) return explicit;
+
+      var scoped = target ? target.closest("[data-composition-id][data-fps]") : null;
+      var root = scoped || document.querySelector("[data-composition-id][data-fps]");
+      var rootFps = root ? Number(root.getAttribute("data-fps")) : 0;
+      if (rootFps > 0) return rootFps;
+
+      return 30;
+    }
+
+    function numOption(value, fallback) {
+      return value !== undefined ? Number(value) : fallback;
+    }
+
+    // A resolved `transform` is either "none", a 2D matrix(a,b,c,d,e,f) or a 3D
+    // matrix3d of 16. Splitting the numbers into the linear part and the
+    // translation is what lets the deadband below use a pixel tolerance on the
+    // one and an angle/ratio tolerance on the other.
+    function parseTransform(value) {
+      if (!value || value === "none") return { linear: [1, 0, 0, 1], translate: [0, 0, 0] };
+      var nums = value
+        .slice(value.indexOf("(") + 1, -1)
+        .split(",")
+        .map(parseFloat);
+      if (nums.length === 16) {
+        return {
+          linear: [
+            nums[0],
+            nums[1],
+            nums[2],
+            nums[4],
+            nums[5],
+            nums[6],
+            nums[8],
+            nums[9],
+            nums[10],
+            nums[3],
+            nums[7],
+            nums[11],
+            nums[15],
+          ],
+          translate: [nums[12], nums[13], nums[14]],
+        };
+      }
+      return {
+        linear: [nums[0], nums[1], nums[2], nums[3]],
+        translate: [nums[4], nums[5], 0],
+      };
+    }
+
+    // Deadband: half a pixel of travel, a thousandth of a unit of linear change,
+    // about 0.06 degrees or 0.1% of scale. Below it the average is the source.
+    // The 2D and 3D forms have different arities, so a change of form counts as
+    // movement rather than being compared component by component.
+    function differs(a, b) {
+      if (a.linear.length !== b.linear.length) return true;
+      for (var i = 0; i < a.linear.length; i++) {
+        if (Math.abs(a.linear[i] - b.linear[i]) > 0.001) return true;
+      }
+      for (var j = 0; j < 3; j++) {
+        if (Math.abs(a.translate[j] - b.translate[j]) > 0.5) return true;
+      }
+      return false;
+    }
+
+    window.attachMotionBlur = function (selector, tl, opts) {
+      opts = opts || {};
+      var shutterAngle = numOption(opts.shutterAngle, 720);
+      var shutterPhase = numOption(opts.shutterPhase, -360);
+      var requestedSamples = numOption(opts.samplesPerFrame, 16);
+      var samples = Number.isFinite(requestedSamples)
+        ? Math.max(2, Math.min(64, Math.round(requestedSamples)))
+        : 16;
+      var items = Array.isArray(selector) ? selector : [selector];
+      var targets = items.reduce(function (acc, s) {
+        if (typeof s === "string") {
+          document.querySelectorAll(s).forEach(function (el) {
+            acc.push(el);
+          });
+        } else if (s instanceof Element) {
+          acc.push(s);
+        }
+        return acc;
+      }, []);
+
+      // `samples` counts sub-intervals of the shutter window, so there is one copy at
+      // every interval boundary — both ends of the window included — and each carries
+      // 1/samples of the source. That is what the reference export shows: the outermost
+      // copy sits exactly one frame away from the frame time, not half a step short.
+      var copies = samples + 1;
+      var alpha = String(1 / samples);
+
+      // A copy is styled by nothing that selected the original: dropping the id also
+      // drops every `#id` rule that gave it size, colour and font. So each copy carries
+      // its own resolved style inline. Chrome returns "" for a computed style's cssText,
+      // so the declarations are enumerated rather than taken wholesale.
+      function resolvedStyles(source, out) {
+        var cs = getComputedStyle(source);
+        var text = "";
+        for (var i = 0; i < cs.length; i++) {
+          text += cs[i] + ":" + cs.getPropertyValue(cs[i]) + ";";
+        }
+        // A copy is a still of one instant. Left live, an inherited transition or
+        // keyframe animation would carry it somewhere the timeline never sampled.
+        out.push(text + "transition:none;animation:none;");
+        for (var c = 0; c < source.children.length; c++) {
+          resolvedStyles(source.children[c], out);
+        }
+        return out;
+      }
+
+      function paintResolvedStyles(copy, styles, cursor) {
+        copy.style.cssText = styles[cursor.i++];
+        for (var c = 0; c < copy.children.length; c++) {
+          paintResolvedStyles(copy.children[c], styles, cursor);
+        }
+      }
+
+      // Perspective applies to a parent's children only, and a copy is a grandchild.
+      // Sharing the parent's 3D context would need preserve-3d on the group, which
+      // mix-blend-mode flattens, so each copy carries the perspective itself. See the
+      // header for what that does to the vanishing point.
+      function parentPerspective(el) {
+        var value = el.parentNode ? getComputedStyle(el.parentNode).perspective : "none";
+        return value && value !== "none" ? "perspective(" + value + ") " : "";
+      }
+
+      function attachOne(el) {
+        var group = document.createElement("div");
+        group.setAttribute("data-hf-motion-blur-group", "hf-mb-" + window._hfMbUid++);
+        group.style.cssText =
+          "position:absolute;left:0;top:0;width:0;height:0;isolation:isolate;pointer-events:none;display:none;";
+
+        var clones = [];
+        for (var k = 0; k < copies; k++) {
+          var clone = el.cloneNode(true);
+          clone.removeAttribute("id");
+          stripCopyAttrs(clone);
+          clones.push(clone);
+          group.appendChild(clone);
+        }
+        var s = {
+          el: el,
+          group: group,
+          clones: clones,
+          samples: [],
+          perspective: "",
+          watch: null,
+        };
+
+        // Resolved styles and the parent's perspective are px once read, so a
+        // container-relative element needs them again when its box changes. Per frame
+        // that would walk the whole subtree once per copy; on resize it costs nothing
+        // on a fixed-size render and keeps a live preview honest.
+        function snapshot() {
+          var styles = resolvedStyles(el, []);
+          s.perspective = parentPerspective(el);
+          for (var c = 0; c < clones.length; c++) {
+            paintResolvedStyles(clones[c], styles, { i: 0 });
+            clones[c].style.position = "absolute";
+            clones[c].style.margin = "0";
+            clones[c].style.opacity = alpha;
+            clones[c].style.mixBlendMode = "plus-lighter";
+          }
+        }
+
+        // Snapshot BEFORE the group enters the page, so a throw in the style walk leaves
+        // nothing behind: the record the rollback needs does not exist until it returns.
+        snapshot();
+        el.parentNode.insertBefore(group, el);
+        if (typeof ResizeObserver === "function") {
+          s.watch = new ResizeObserver(snapshot);
+          s.watch.observe(el);
+        }
+        return s;
+      }
+
+      var state = [];
+      // Every element this call marked. A throw inside `attachOne` never returns its
+      // record, so `state` alone cannot give the marks back.
+      var claimed = [];
+      try {
+        for (var q = 0; q < targets.length; q++) {
+          var candidate = targets[q];
+          // One group per element, whether a second call names it or one call names it
+          // twice: a second set of copies over the first would double the ink. Marked
+          // BEFORE the copies go in: inserting them runs custom-element reactions
+          // synchronously, and one that registers a timeline re-enters the write trap.
+          if (window._hfMbAttached.has(candidate)) continue;
+          window._hfMbAttached.add(candidate);
+          window._hfMbTimeline.set(candidate, tl);
+          claimed.push(candidate);
+          state.push(attachOne(candidate));
+        }
+      } catch (e) {
+        unmark(claimed);
+        discard(state);
+        throw e;
+      }
+      // Nothing to blur means nothing to seek: a tracker here would run the whole sample
+      // loop every frame over an empty set.
+      if (state.length === 0) return;
+
+      // One seek loop drives the whole call, so the window is ONE length, and it belongs
+      // to the composition of an element this call actually attached.
+      var fps = resolveFps(opts.fps, state[0].el);
+      for (var d = 1; d < state.length; d++) {
+        if (resolveFps(opts.fps, state[d].el) === fps) continue;
+        var line = "one call cannot blur compositions at different frame rates; using ";
+        console.warn("[motion-blur] " + line + fps, state[d].el);
+        break;
+      }
+
+      function readTransform(el) {
+        var cs = getComputedStyle(el);
+        return {
+          css: cs.transform,
+          origin: cs.transformOrigin,
+          opacity: cs.opacity,
+          parsed: parseTransform(cs.transform),
+        };
+      }
+
+      var scheduled = false;
+
+      function applyShutter() {
+        var shutterTime = shutterAngle / 360 / fps;
+        if (!(shutterTime > 0)) {
+          state.forEach(function (s) {
+            s.group.style.display = "none";
+          });
+          return;
+        }
+
+        var t0 = tl.time();
+        var duration = tl.duration();
+        var windowStart = t0 + shutterPhase / 360 / fps;
+
+        // Sample the real trajectory: seek to each sub-frame time with events
+        // suppressed (so no tween callbacks, including this tracker's, fire),
+        // read the resolved transform, then restore the frame time.
+        try {
+          for (var k = 0; k < copies; k++) {
+            var tk = windowStart + (k / samples) * shutterTime;
+            tl.time(Math.min(duration, Math.max(0, tk)), true);
+            state.forEach(function (s) {
+              s.samples[k] = readTransform(s.el);
+            });
+          }
+        } finally {
+          tl.time(t0, true);
+        }
+
+        state.forEach(function (s) {
+          var current = readTransform(s.el);
+          var moved = false;
+          for (var i = 0; i < copies; i++) {
+            if (differs(s.samples[i].parsed, current.parsed)) {
+              moved = true;
+              break;
+            }
+          }
+          if (!moved) {
+            s.group.style.display = "none";
+            return;
+          }
+
+          // The copies are absolutely positioned inside the group, and the group sits at
+          // the origin of the element's own containing block, so the element's offset box
+          // places them. Re-read every frame: a beat is free to move the box itself.
+          var left = s.el.offsetLeft + "px";
+          var top = s.el.offsetTop + "px";
+          var width = s.el.offsetWidth + "px";
+          var height = s.el.offsetHeight + "px";
+          for (var j = 0; j < copies; j++) {
+            var clone = s.clones[j];
+            clone.style.left = left;
+            clone.style.top = top;
+            clone.style.width = width;
+            clone.style.height = height;
+            clone.style.transformOrigin = s.samples[j].origin;
+            clone.style.transform =
+              s.perspective + (s.samples[j].css === "none" ? "" : s.samples[j].css);
+          }
+          // The copies are the element's own ink, so they have to carry its opacity too:
+          // a beat that moves and fades at once would otherwise leave a full-strength
+          // smear behind a vanishing element. It rides the group, not the copies, whose
+          // own opacity is the 1/N shutter weight.
+          s.group.style.opacity = current.opacity;
+          s.group.style.display = "";
+        });
+      }
+
+      // tl.eventCallback("onUpdate") is unavailable under the HyperFrames runtime proxy, so a
+      // tracker tween's onUpdate fires on every seek. Sampling is deferred to a microtask:
+      // seeking GSAP from inside its own render reads stale tween state, while the microtask
+      // runs after the seek returns and before the frame is captured or painted.
+      var _proxy = { t: 0 };
+      try {
+        tl.to(
+          _proxy,
+          {
+            t: 1,
+            duration: Math.max(tl.duration(), 0.1),
+            ease: "none",
+            onUpdate: function () {
+              if (scheduled) return;
+              scheduled = true;
+              Promise.resolve().then(function () {
+                scheduled = false;
+                applyShutter();
+              });
+            },
+          },
+          0,
+        );
+      } catch (e) {
+        unmark(claimed);
+        discard(state);
+        throw e;
+      }
+    };
+
+    // An empty attribute means defaults; anything else is a JSON options object. A value that
+    // is not an options object is skipped loudly rather than read as defaults, because a typo
+    // in it would otherwise render as a silently unblurred element.
+    function sweepOptions(el) {
+      var text = (el.getAttribute(SWEEP_ATTR) || "").trim();
+      if (text === "") return {};
+      var parsed = null;
+      try {
+        parsed = JSON.parse(text);
+      } catch (e) {
+        return refuse(el, "is not JSON: " + text);
+      }
+      // `null`, a number and a string all parse. None of them is a set of options.
+      if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+        return refuse(el, "is not a JSON object: " + text);
+      }
+      var bad = unknownKey(parsed);
+      if (bad !== null) return refuse(el, "names no such option: " + bad);
+      var wrong = nonNumber(parsed);
+      if (wrong !== null) return refuse(el, "needs a number for " + wrong);
+      return parsed;
+    }
+
+    // A misspelled key is the likeliest typo in a JSON object, and reading it as
+    // defaults is the silent no-op this attribute exists to remove.
+    function unknownKey(parsed) {
+      for (var key in parsed) {
+        if (OPTION_KEYS.indexOf(key) < 0) return key;
+      }
+      return null;
+    }
+
+    // A key with a value the shutter cannot use is the same silent no-op as a key it does
+    // not know: a non-numeric angle hides the smear, a non-numeric phase parks every copy
+    // at the timeline's start. JSON gives real numbers, so anything else is a typo.
+    function nonNumber(parsed) {
+      for (var i = 0; i < OPTION_KEYS.length; i++) {
+        var held = parsed[OPTION_KEYS[i]];
+        if (held === undefined) continue;
+        if (typeof held !== "number" || !Number.isFinite(held)) return OPTION_KEYS[i];
+      }
+      return null;
+    }
+
+    // A throw partway through an attach leaves an element blurred by nothing, so the copies
+    // go too, along with the observer that would otherwise keep walking a detached subtree
+    // on every resize of an element nothing blurs.
+    // The mark is what a second trigger reads, so it is the first thing to give back.
+    function unmark(els) {
+      for (var i = 0; i < els.length; i++) {
+        window._hfMbAttached.delete(els[i]);
+        window._hfMbTimeline.delete(els[i]);
+      }
+    }
+
+    function discard(state) {
+      for (var i = 0; i < state.length; i++) {
+        var s = state[i];
+        if (s.watch !== null) s.watch.disconnect();
+        if (s.group.parentNode !== null) s.group.parentNode.removeChild(s.group);
+      }
+    }
+
+    function refuse(el, why) {
+      window._hfMbSkipped.add(el);
+      console.warn("[motion-blur] " + SWEEP_ATTR + " " + why, el);
+      return null;
+    }
+
+    // An element belongs to the nearest composition above it, so a sub-composition's
+    // targets follow that sub-composition's own timeline.
+    function compositionOf(el) {
+      var host = el.closest("[data-composition-id]");
+      return host ? host.getAttribute("data-composition-id") : null;
+    }
+
+    // Anything else registered on the container is somebody else's bookkeeping: a
+    // timeline is the thing this snippet can seek and extend.
+    function isTimeline(value) {
+      return !!value && typeof value.time === "function" && typeof value.to === "function";
+    }
+
+    // Attached, or skipped as unparseable. Both are terminal, so a later trigger must not
+    // report or attach the element twice.
+    function handled(el) {
+      return window._hfMbAttached.has(el) || window._hfMbSkipped.has(el);
+    }
+
+    // The timeline registered for an element's own composition, or null. Read from the
+    // registry rather than taken from whoever wrote it, so every trigger agrees.
+    function timelineFor(el) {
+      var id = compositionOf(el);
+      if (id === null) return null;
+      var registry = window.__timelines;
+      var found = registry ? registry[id] : null;
+      return isTimeline(found) ? found : null;
+    }
+
+    // A marked element whose parent is not an Element has no target above it: the parent
+    // of a root is the Document, which has no `closest`.
+    function nestedInTarget(el) {
+      var parent = el.parentNode;
+      if (parent === null || typeof parent.closest !== "function") return false;
+      return parent.closest(SWEEP_SELECTOR) !== null;
+    }
+
+    // One owner of attaching one element. Answers whether the element still needs a trigger.
+    function claim(el) {
+      var tl = timelineFor(el);
+      if (handled(el)) {
+        var owner = window._hfMbTimeline.get(el);
+        // Re-registering a key with a DIFFERENT timeline leaves the copies driven by the one
+        // nobody seeks, which renders sharp and says nothing. Report it rather than guess.
+        var changed = tl !== null && owner !== undefined && owner !== tl;
+        if (changed && !window._hfMbWarned.has(el)) {
+          window._hfMbWarned.add(el);
+          console.warn(
+            "[motion-blur] a second timeline registered for this element; the copies still follow the first",
+            el,
+          );
+        }
+        return true;
+      }
+      // Its group would be inserted into the live outer element, so the outer target's
+      // style replay would walk a subtree its cursor no longer matches.
+      if (nestedInTarget(el)) {
+        refuse(el, "cannot blur a target inside another target; blur one of them");
+        return true;
+      }
+      var opts = sweepOptions(el);
+      if (opts === null) return true;
+      if (tl === null) return false;
+      window.attachMotionBlur(el, tl, opts);
+      return true;
+    }
+
+    // Returns the elements still waiting for their composition to register a timeline.
+    // The trap below runs this INSIDE the author's registration statement, so one bad
+    // target must not abort the rest of their composition script.
+    function sweep() {
+      var pending = [];
+      document.querySelectorAll(SWEEP_SELECTOR).forEach(function (el) {
+        try {
+          if (!claim(el)) pending.push(el);
+        } catch (e) {
+          window._hfMbSkipped.add(el);
+          console.warn("[motion-blur] could not blur this element: " + e, el);
+        }
+      });
+      return pending;
+    }
+
+    // Registering a timeline is the moment the author has finished building it, so trapping
+    // the write attaches before the renderer captures a frame. A microtask would be too
+    // early: it runs before the next `<script>` tag.
+    function registrationProxy(container) {
+      var proxy = new Proxy(container, {
+        set: function (target, key, value) {
+          target[key] = value;
+          if (typeof key === "string") sweep();
+          return true;
+        },
+      });
+      window._hfMbProxies.add(proxy);
+      return proxy;
+    }
+
+    function hookRegistration() {
+      var held = window.__timelines;
+      Object.defineProperty(window, "__timelines", {
+        configurable: true,
+        enumerable: true,
+        get: function () {
+          return held;
+        },
+        set: function (value) {
+          var container = !!value && typeof value === "object";
+          var fresh = container && !window._hfMbProxies.has(value);
+          held = fresh ? registrationProxy(value) : value;
+          if (fresh) sweep();
+        },
+      });
+      // A container assigned before this snippet ran is replayed through the setter, so a
+      // timeline already registered on it is swept too.
+      if (held !== undefined) window.__timelines = held;
+    }
+
+    // The trap above cannot see every registration: the runtime owns the registry object,
+    // wraps it per sub-composition, and mounts nested compositions asynchronously. So the
+    // registry is also POLLED, which needs no cooperation from whoever writes it.
+    function poll(ticks) {
+      var pending = sweep();
+      // The WHOLE budget, every time. Stopping the first tick nothing is pending kills the
+      // poll one tick into an ordinary page, which is before a late composition arrives.
+      if (ticks > 0) {
+        setTimeout(function () {
+          poll(ticks - 1);
+        }, POLL_MS);
+        return;
+      }
+      if (pending.length === 0) return;
+      var count = pending.length + " element(s) carry " + SWEEP_ATTR;
+      console.warn(
+        "[motion-blur] " + count + ", and no composition registered a timeline for them",
+        pending,
+      );
+    }
+
+    if (!window._hfMbHooked) {
+      window._hfMbHooked = true;
+      hookRegistration();
+      poll(POLL_TICKS);
+    }
+    /* SHUTTER_SNIPPET_END */
+  })();
+</script>
+    <style>
+      /* Uslub: ~/VideoMontaj/styles/green-minimal/STYLE.md (premium ishlov: 6–8-bo'limlar) */
+      @font-face {
+        font-family: "Inter Tight";
+        src: url("assets/fonts/InterTight.ttf") format("truetype");
+        font-weight: 100 900;
+      }
+      @font-face {
+        font-family: "Instrument Serif";
+        src: url("assets/fonts/InstrumentSerif-Italic.ttf") format("truetype");
+        font-style: italic;
+        font-weight: 400;
+      }
+      :root {
+        --fon: #fdfdfd;
+        --siyoh: #0b0b0b;
+        --yashil: #10be00;
+        --yashil-matn: #27a01a;
+        --yashil-tuq: #1f8f12;
+        --kulrang: #8a8a8a;
+        --soya: 0 50px 100px rgba(11, 11, 11, 0.13), 0 14px 30px rgba(11, 11, 11, 0.07), 0 2px 6px rgba(11, 11, 11, 0.05);
+        --soya-yashil: 0 40px 90px rgba(31, 143, 18, 0.35), 0 10px 24px rgba(31, 143, 18, 0.25);
+      }
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        width: 1080px;
+        height: 1920px;
+        overflow: hidden;
+        background: var(--fon);
+      }
+      #root {
+        position: relative;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        background: var(--fon);
+        font-family: "Inter Tight", sans-serif;
+        font-weight: 500;
+        color: var(--siyoh);
+      }
+      em,
+      .serif {
+        font-family: "Instrument Serif", serif;
+        font-style: italic;
+        font-weight: 400;
+        letter-spacing: -0.01em;
+        color: var(--yashil-matn);
+      }
+      /* ---------- fon: xira yashil yoylar, ingichka halqalar, yumshoq nur, grain ---------- */
+      .dekor,
+      .grain,
+      .vinyetka {
+        position: absolute;
+        inset: 0;
+        pointer-events: none;
+      }
+      .yoy {
+        position: absolute;
+        border-radius: 50%;
+        border: 80px solid rgba(16, 190, 0, 0.15);
+        border-right-color: transparent;
+        border-bottom-color: transparent;
+        filter: blur(30px);
+      }
+      .yoy.a {
+        width: 820px;
+        height: 820px;
+        left: -420px;
+        top: -300px;
+      }
+      .yoy.b {
+        width: 980px;
+        height: 980px;
+        right: -520px;
+        bottom: -420px;
+      }
+      .halqa {
+        position: absolute;
+        border-radius: 50%;
+        border: 2px solid rgba(138, 138, 138, 0.16);
+      }
+      .halqa.a {
+        width: 1100px;
+        height: 1100px;
+        left: -640px;
+        top: 1150px;
+      }
+      .halqa.b {
+        width: 700px;
+        height: 700px;
+        right: -380px;
+        top: -200px;
+      }
+      .nur {
+        position: absolute;
+        width: 1100px;
+        height: 1100px;
+        left: -10px;
+        top: 460px;
+        border-radius: 50%;
+        background: radial-gradient(circle, rgba(16, 190, 0, 0.1) 0%, rgba(16, 190, 0, 0) 62%);
+      }
+      .grain {
+        opacity: 0.07;
+        mix-blend-mode: multiply;
+      }
+      .grain svg {
+        width: 100%;
+        height: 100%;
+        display: block;
+      }
+      .vinyetka {
+        background: radial-gradient(ellipse 80% 70% at 50% 50%, rgba(0, 0, 0, 0) 60%, rgba(11, 11, 11, 0.06) 100%);
+      }
+      /* ---------- sahna ---------- */
+      .sahna {
+        position: absolute;
+        inset: 0;
+      }
+      .ich {
+        position: absolute;
+        inset: 0;
+      }
+      .fonraqam {
+        position: absolute;
+        font-weight: 700;
+        letter-spacing: -0.07em;
+        color: rgba(16, 190, 0, 0.055);
+        white-space: nowrap;
+        line-height: 1;
+      }
+      .eyebrow {
+        position: absolute;
+        top: 272px;
+        left: 0;
+        right: 0;
+        text-align: center;
+        font-size: 28px;
+        font-weight: 600;
+        letter-spacing: 0.32em;
+        text-transform: uppercase;
+        color: var(--kulrang);
+      }
+      .eyebrow .nuqta {
+        display: inline-block;
+        width: 12px;
+        height: 12px;
+        border-radius: 50%;
+        background: var(--yashil);
+        margin-right: 18px;
+        vertical-align: 3px;
+      }
+      .sarlavha {
+        position: absolute;
+        top: 326px;
+        left: 70px;
+        right: 70px;
+        text-align: center;
+        font-size: 112px;
+        line-height: 1.02;
+        letter-spacing: -0.055em;
+        font-weight: 600;
+      }
+      .sarlavha em {
+        font-size: 1.14em;
+        letter-spacing: -0.02em;
+      }
+      .w {
+        display: inline-block;
+      }
+      .izoh {
+        position: absolute;
+        left: 60px;
+        right: 60px;
+        text-align: center;
+        font-size: 56px;
+        line-height: 1.12;
+        letter-spacing: -0.035em;
+      }
+      .izoh em {
+        font-size: 1.2em;
+      }
+      .glow {
+        position: absolute;
+        border-radius: 50%;
+        background: radial-gradient(circle, rgba(16, 190, 0, 0.26) 0%, rgba(16, 190, 0, 0) 64%);
+      }
+      .kartochka {
+        background: #fff;
+        border-radius: 40px;
+        box-shadow: var(--soya);
+      }
+      /* ring */
+      .ring {
+        position: absolute;
+        left: 190px;
+        width: 700px;
+        height: 700px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+      .ring .disk {
+        position: absolute;
+        inset: 58px;
+        border-radius: 50%;
+        background: #fff;
+        box-shadow: var(--soya);
+      }
+      .ring svg {
+        position: absolute;
+        inset: 0;
+        width: 700px;
+        height: 700px;
+      }
+      .ring .son {
+        position: relative;
+        font-size: 176px;
+        letter-spacing: -0.06em;
+        font-weight: 600;
+      }
+      /* viewfinder (yuz) */
+      #vfTashqi {
+        position: absolute;
+        left: 110px;
+        top: 590px;
+        width: 860px;
+        height: 880px;
+        opacity: 0;
+      }
+      #vfKarta {
+        position: absolute;
+        inset: 30px;
+        border-radius: 44px;
+        overflow: hidden;
+        background: #e9e9e9;
+        box-shadow: var(--soya);
+      }
+      #aroll {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+        object-position: 50% 26%;
+      }
+      .qavs {
+        position: absolute;
+        width: 96px;
+        height: 96px;
+        border: 0 solid var(--yashil);
+      }
+      .qavs.tl {
+        left: 0;
+        top: 0;
+        border-left-width: 8px;
+        border-top-width: 8px;
+        border-top-left-radius: 18px;
+      }
+      .qavs.tr {
+        right: 0;
+        top: 0;
+        border-right-width: 8px;
+        border-top-width: 8px;
+        border-top-right-radius: 18px;
+      }
+      .qavs.bl {
+        left: 0;
+        bottom: 0;
+        border-left-width: 8px;
+        border-bottom-width: 8px;
+        border-bottom-left-radius: 18px;
+      }
+      .qavs.br {
+        right: 0;
+        bottom: 0;
+        border-right-width: 8px;
+        border-bottom-width: 8px;
+        border-bottom-right-radius: 18px;
+      }
+      .rec {
+        position: absolute;
+        right: 70px;
+        top: 66px;
+        padding: 12px 22px;
+        border-radius: 999px;
+        background: rgba(11, 11, 11, 0.55);
+        color: #fff;
+        font-size: 26px;
+        font-weight: 600;
+        letter-spacing: 0.12em;
+      }
+      .rec i {
+        display: inline-block;
+        width: 14px;
+        height: 14px;
+        border-radius: 50%;
+        background: var(--yashil);
+        margin-right: 10px;
+        vertical-align: 1px;
+      }
+      /* narx kartochkalari */
+      .narx {
+        position: absolute;
+        left: 160px;
+        width: 760px;
+        height: 196px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 116px;
+        font-weight: 600;
+        letter-spacing: -0.06em;
+      }
+      .narx.kul {
+        color: #7f7f7f;
+        background: #f6f6f6;
+        box-shadow: none;
+        border: 2px solid #ececec;
+      }
+      .narx .chiz {
+        position: absolute;
+        left: 200px;
+        right: 200px;
+        top: 50%;
+        height: 8px;
+        border-radius: 4px;
+        background: #9a9a9a;
+        transform-origin: left center;
+      }
+      .narx.yashil {
+        color: #fff;
+        background: linear-gradient(135deg, #2bb51b 0%, #1f8f12 100%);
+        box-shadow: var(--soya-yashil);
+        height: 236px;
+        font-size: 150px;
+      }
+      .narx .teg {
+        position: absolute;
+        right: 34px;
+        top: 26px;
+        font-size: 26px;
+        font-weight: 600;
+        letter-spacing: 0.14em;
+        text-transform: uppercase;
+        color: rgba(255, 255, 255, 0.85);
+      }
+      /* typewriter */
+      .yoz {
+        position: absolute;
+        left: 90px;
+        right: 90px;
+        font-size: 118px;
+        line-height: 1.02;
+        letter-spacing: -0.055em;
+        font-weight: 600;
+      }
+      .yoz .soz {
+        display: inline-block;
+        white-space: nowrap;
+      }
+      .yoz .h {
+        display: inline-block;
+      }
+      .yoz.serif {
+        font-weight: 400;
+        font-size: 150px;
+        letter-spacing: -0.02em;
+        line-height: 1.1;
+      }
+      .kursor {
+        display: inline-block;
+        vertical-align: -14px;
+        margin-left: 10px;
+        width: 10px;
+        height: 110px;
+        border-radius: 5px;
+        background: var(--yashil);
+      }
+      /* soat */
+      #soatSahna {
+        position: absolute;
+        left: 140px;
+        top: 610px;
+        width: 800px;
+        height: 800px;
+      }
+      #soatKarta {
+        position: absolute;
+        inset: 0;
+        border-radius: 50%;
+        background: #fff;
+        box-shadow: var(--soya);
+      }
+      #soatSahna svg {
+        position: absolute;
+        inset: 0;
+        width: 800px;
+        height: 800px;
+      }
+      /* hexagon konstellatsiya */
+      #konst {
+        position: absolute;
+        left: 0;
+        top: 560px;
+        width: 1080px;
+        height: 910px;
+      }
+      #konst svg.chiziqlar {
+        position: absolute;
+        inset: 0;
+        width: 1080px;
+        height: 910px;
+      }
+      .hex {
+        position: absolute;
+        width: 220px;
+        height: 244px;
+        margin-left: -110px;
+        margin-top: -122px;
+      }
+      .hex .ich6 {
+        position: absolute;
+        inset: 0;
+      }
+      .hex svg {
+        width: 220px;
+        height: 244px;
+        display: block;
+        filter: drop-shadow(0 26px 34px rgba(31, 143, 18, 0.35));
+      }
+      .tegcha {
+        position: absolute;
+        padding: 18px 30px;
+        border-radius: 999px;
+        background: #fff;
+        box-shadow: var(--soya);
+        font-size: 40px;
+        font-weight: 600;
+        letter-spacing: -0.03em;
+        white-space: nowrap;
+      }
+      .markazdoira {
+        position: absolute;
+        width: 190px;
+        height: 190px;
+        margin-left: -95px;
+        margin-top: -95px;
+        border-radius: 50%;
+        background: var(--siyoh);
+        color: #fff;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-family: "Instrument Serif", serif;
+        font-style: italic;
+        font-size: 78px;
+        box-shadow: 0 30px 60px rgba(11, 11, 11, 0.25);
+      }
+      .markazdoira .halqa2 {
+        position: absolute;
+        inset: -26px;
+        border-radius: 50%;
+        border: 3px solid rgba(16, 190, 0, 0.5);
+      }
+      /* zarrachalar */
+      .zarra {
+        position: absolute;
+        width: 64px;
+        height: 64px;
+        margin-left: -32px;
+        margin-top: -32px;
+        border-radius: 50%;
+        background: #fff;
+        box-shadow: var(--soya);
+        color: var(--yashil-tuq);
+        font-weight: 700;
+        font-size: 34px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+      /* qadamlar (vertikal) */
+      #qadamlar {
+        position: absolute;
+        left: 120px;
+        top: 640px;
+        width: 860px;
+        height: 700px;
+      }
+      #qadamlar .rels {
+        position: absolute;
+        left: 58px;
+        top: 60px;
+        width: 6px;
+        height: 540px;
+        border-radius: 3px;
+        background: #ececec;
+      }
+      #qadamlar .rels i {
+        position: absolute;
+        inset: 0;
+        border-radius: 3px;
+        background: var(--yashil);
+        transform-origin: top center;
+      }
+      .qator {
+        position: absolute;
+        left: 0;
+        height: 120px;
+        display: flex;
+        align-items: center;
+      }
+      .qator .doira {
+        width: 122px;
+        height: 122px;
+        border-radius: 50%;
+        background: linear-gradient(135deg, #2bb51b 0%, #1f8f12 100%);
+        box-shadow: var(--soya-yashil);
+        color: #fff;
+        font-size: 56px;
+        font-weight: 600;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        flex: none;
+      }
+      .qator .nom {
+        margin-left: 44px;
+        font-size: 72px;
+        font-weight: 600;
+        letter-spacing: -0.05em;
+      }
+      /* CTA */
+      #tugmaTashqi {
+        position: absolute;
+        left: 100px;
+        top: 1010px;
+        width: 880px;
+        height: 210px;
+      }
+      #tugma {
+        position: absolute;
+        inset: 0;
+        border-radius: 999px;
+        background: linear-gradient(135deg, #2bb51b 0%, #1f8f12 100%);
+        box-shadow: var(--soya-yashil);
+        color: #fff;
+        font-size: 74px;
+        font-weight: 600;
+        letter-spacing: -0.045em;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        overflow: hidden;
+      }
+      #tugma .yaltir {
+        position: absolute;
+        top: -40px;
+        left: 0;
+        width: 180px;
+        height: 300px;
+        background: linear-gradient(90deg, rgba(255, 255, 255, 0) 0%, rgba(255, 255, 255, 0.55) 50%, rgba(255, 255, 255, 0) 100%);
+      }
+      #tugma .strelka {
+        margin-left: 26px;
+        font-weight: 500;
+      }
+      .ellips {
+        position: absolute;
+        left: -60px;
+        top: -70px;
+        width: 1000px;
+        height: 350px;
+        overflow: visible;
+      }
+      #kursor {
+        position: absolute;
+        left: 760px;
+        top: 1190px;
+        width: 90px;
+        height: 110px;
+      }
+      #toshqin {
+        position: absolute;
+        left: 690px;
+        top: 1080px;
+        width: 140px;
+        height: 140px;
+        border-radius: 50%;
+        border: 6px solid rgba(255, 255, 255, 0.9);
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root" data-composition-id="main" data-start="0" data-duration="25.36" data-width="1080" data-height="1920">
+      <div class="dekor">
+        <div class="nur" id="nur"></div>
+        <div class="yoy a" id="yoyA" data-layout-allow-overflow></div>
+        <div class="yoy b" id="yoyB" data-layout-allow-overflow></div>
+        <div class="halqa a" id="halqaA" data-layout-allow-overflow></div>
+        <div class="halqa b" id="halqaB" data-layout-allow-overflow></div>
+      </div>
+
+      <!-- 1. Hook: hali ham $500 -->
+      <section class="sahna clip" id="s1" data-start="0" data-duration="3.42" data-track-index="1">
+        <div class="ich">
+          <div class="fonraqam" id="s1fon" style="left: -60px; top: 760px; font-size: 520px" data-layout-allow-overflow data-layout-ignore aria-hidden="true">$500</div>
+          <div class="eyebrow w" data-at="0.15"><span class="nuqta"></span>Savol</div>
+          <h2 class="sarlavha"><span class="w" data-at="0.08">Siz</span> <span class="w" data-at="0.42">hali</span> <span class="w" data-at="0.53">ham</span> <span class="w" data-at="0.65">xizmatingizni</span></h2>
+          <div class="glow" id="s1glow" style="left: 40px; top: 560px; width: 1000px; height: 1000px"></div>
+          <div class="ring" id="s1ringT" style="top: 640px">
+            <div class="disk"></div>
+            <svg viewBox="0 0 700 700">
+              <circle cx="350" cy="350" r="320" fill="none" stroke="#ececec" stroke-width="22" />
+              <circle id="s1arc" cx="350" cy="350" r="320" fill="none" stroke="#10BE00" stroke-width="22" stroke-linecap="round" transform="rotate(-90 350 350)" stroke-dasharray="2011" stroke-dashoffset="2011" />
+            </svg>
+            <div class="son" id="s1son">$0</div>
+          </div>
+          <div class="izoh" style="top: 1376px"><span class="w" data-at="2.2">dan</span> <span class="w" data-at="2.5">qimmat</span> <em class="w" data-at="2.8">sota</em> <em class="w" data-at="3.0">olmayapsizmi?</em></div>
+        </div>
+      </section>
+
+      <!-- 2. Bu vaqtda men — yuz -->
+      <section class="sahna clip" id="s2" data-start="3.42" data-duration="2.15" data-track-index="1">
+        <div class="ich">
+          <div class="eyebrow w" data-at="3.45"><span class="nuqta"></span>Mening natijam</div>
+          <h2 class="sarlavha"><span class="w" data-at="3.42">Bu</span> <span class="w" data-at="3.76">vaqtda</span> <em class="w" data-at="4.0">men</em></h2>
+        </div>
+      </section>
+
+      <!-- 3. Narx zinapoyasi -->
+      <section class="sahna clip" id="s3" data-start="5.57" data-duration="2.75" data-track-index="1">
+        <div class="ich">
+          <div class="fonraqam" id="s3fon" style="left: -40px; top: 980px; font-size: 470px" data-layout-allow-overflow data-layout-ignore aria-hidden="true">$2000</div>
+          <div class="eyebrow w" data-at="5.6"><span class="nuqta"></span>Bitta loyiha narxi</div>
+          <h2 class="sarlavha"><span class="w" data-at="5.57">Har bir</span> <em class="w" data-at="5.75">loyiha</em></h2>
+          <div class="glow" id="s3glow" style="left: 90px; top: 860px; width: 900px; height: 700px"></div>
+          <div class="narx kartochka kul" id="n500" style="top: 636px"><span>$500</span><div class="chiz" id="n500chiz"></div></div>
+          <div class="narx kartochka" id="n1500" style="top: 866px">$1 500</div>
+          <div class="narx kartochka yashil" id="n2000" style="top: 1096px" data-hf-motion-blur><span class="teg">hozir</span>$2 000</div>
+          <div class="izoh" style="top: 1366px"><em class="w" data-at="7.5" style="font-size: 84px">sotyapman</em></div>
+        </div>
+      </section>
+
+      <!-- 4. Buni qanday qildim? -->
+      <section class="sahna clip" id="s4" data-start="8.32" data-duration="2.55" data-track-index="1">
+        <div class="ich">
+          <div class="fonraqam serif" id="s4fon" style="right: -120px; top: 520px; font-size: 1200px; color: rgba(16, 190, 0, 0.07)" data-layout-allow-overflow data-layout-ignore aria-hidden="true">?</div>
+          <div class="eyebrow w" data-at="8.35" style="text-align: left; left: 90px"><span class="nuqta"></span>Sir</div>
+          <div class="yoz" id="s4yoz" data-type="8.4" data-step="0.04" style="top: 640px">Buni qanday qilganimni</div>
+          <span class="kursor" id="s4kursor"></span>
+          <div class="yoz serif" id="s4yoz2" data-type="10.0" data-step="0.03" style="top: 940px; color: var(--yashil-matn)">bilishni xohlaysizmi?</div>
+        </div>
+      </section>
+
+      <!-- 5. Oktyabr — 3D soat -->
+      <section class="sahna clip" id="s5" data-start="10.87" data-duration="2.28" data-track-index="1">
+        <div class="ich">
+          <div class="eyebrow w" data-at="10.9"><span class="nuqta"></span>Shogirdlik dasturi</div>
+          <h2 class="sarlavha"><em class="w" data-at="10.87">Oktyabr</em> <span class="w" data-at="11.28">oyida</span></h2>
+          <div id="soatSahna">
+            <div id="soatKarta"></div>
+            <svg viewBox="0 0 800 800">
+              <circle cx="400" cy="400" r="352" fill="none" stroke="#ececec" stroke-width="10" />
+              <circle id="soatYoy" cx="400" cy="400" r="352" fill="none" stroke="#10BE00" stroke-width="10" stroke-linecap="round" transform="rotate(-90 400 400)" stroke-dasharray="2212" stroke-dashoffset="2212" />
+              <g id="belgilar" stroke-linecap="round"></g>
+              <line id="soatK" x1="400" y1="400" x2="400" y2="210" stroke="#0B0B0B" stroke-width="22" stroke-linecap="round" />
+              <g id="soatUg" data-hf-motion-blur><line x1="400" y1="430" x2="400" y2="120" stroke="#10BE00" stroke-width="12" stroke-linecap="round" /></g>
+              <circle cx="400" cy="400" r="24" fill="#0B0B0B" />
+              <circle cx="400" cy="400" r="10" fill="#10BE00" />
+            </svg>
+          </div>
+          <div class="izoh" style="top: 1420px; font-size: 50px"><span class="w" data-at="11.47">shogirdlik</span> <span class="w" data-at="11.88">dasturi</span> <em class="w" data-at="12.7">boshlanyapti</em></div>
+        </div>
+      </section>
+
+      <!-- 6. Konstellatsiya: siz → 3 yo'nalish -->
+      <section class="sahna clip" id="s6" data-start="13.15" data-duration="4.28" data-track-index="1">
+        <div class="ich">
+          <div class="eyebrow w" data-at="13.2"><span class="nuqta"></span>Dastur ichida</div>
+          <h2 class="sarlavha"><span class="w" data-at="13.15">Bunda</span> <em class="w" data-at="13.54">siz</em></h2>
+          <div id="konst">
+            <svg class="chiziqlar" viewBox="0 0 1080 910">
+              <line id="l1" x1="540" y1="480" x2="250" y2="250" stroke="#0B0B0B" stroke-width="3" stroke-dasharray="370" stroke-dashoffset="370" />
+              <line id="l2" x1="540" y1="480" x2="830" y2="250" stroke="#0B0B0B" stroke-width="3" stroke-dasharray="370" stroke-dashoffset="370" />
+              <line id="l3" x1="540" y1="480" x2="540" y2="760" stroke="#0B0B0B" stroke-width="3" stroke-dasharray="280" stroke-dashoffset="280" />
+            </svg>
+            <div class="markazdoira" id="hub" style="left: 540px; top: 480px"><div class="halqa2" id="hubHalqa"></div>siz</div>
+            <div class="hex" id="hx1" style="left: 250px; top: 250px">
+              <div class="ich6">
+                <svg viewBox="0 0 220 244"><defs><linearGradient id="hg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#2BB51B" /><stop offset="1" stop-color="#1F8F12" /></linearGradient></defs><polygon points="110,6 214,66 214,178 110,238 6,178 6,66" fill="url(#hg)" /><g fill="none" stroke="#fff" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"><path d="M64 104 L64 138 L94 138 L152 164 L152 78 L94 104 Z" /><path d="M94 138 L104 170" /></g></svg>
+              </div>
+              <div class="tegcha" id="t1" style="left: -6px; top: -96px">Kontent marketing</div>
+            </div>
+            <div class="hex" id="hx2" style="left: 830px; top: 250px">
+              <div class="ich6">
+                <svg viewBox="0 0 220 244"><polygon points="110,6 214,66 214,178 110,238 6,178 6,66" fill="url(#hg)" /><path d="M110 64 C140 100 158 120 151 152 C145 178 126 190 110 190 C90 190 70 176 70 148 C70 128 82 116 91 104 C93 120 100 130 109 132 C107 109 104 90 110 64 Z" fill="none" stroke="#fff" stroke-width="8" stroke-linejoin="round" /></svg>
+              </div>
+              <div class="tegcha" id="t2" style="left: 22px; top: -96px">Progrev</div>
+            </div>
+            <div class="hex" id="hx3" style="left: 540px; top: 760px">
+              <div class="ich6">
+                <svg viewBox="0 0 220 244"><polygon points="110,6 214,66 214,178 110,238 6,178 6,66" fill="url(#hg)" /><g fill="none" stroke="#fff" stroke-width="8" stroke-linejoin="round"><path d="M110 74 L168 104 L110 134 L52 104 Z" /><path d="M52 130 L110 160 L168 130" /><path d="M52 156 L110 186 L168 156" /></g></svg>
+              </div>
+              <div class="tegcha" id="t3" style="left: 250px; top: 84px">Hamma turi</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 7. Qimmat sotib → $3 000 -->
+      <section class="sahna clip" id="s7" data-start="17.43" data-duration="3.2" data-track-index="1">
+        <div class="ich">
+          <div class="fonraqam" id="s7fon" style="left: -50px; top: 820px; font-size: 470px" data-layout-allow-overflow data-layout-ignore aria-hidden="true">$3000</div>
+          <div class="eyebrow w" data-at="17.45"><span class="nuqta"></span>Natija</div>
+          <h2 class="sarlavha"><span class="w" data-at="17.45">Xizmatingizni</span> <em class="w" data-at="18.1">qimmat</em> <span class="w" data-at="18.42">sotib</span></h2>
+          <div class="glow" id="s7glow" style="left: 40px; top: 620px; width: 1000px; height: 1000px"></div>
+          <div class="ring" id="s7ringT" style="top: 670px">
+            <div class="disk"></div>
+            <svg viewBox="0 0 700 700">
+              <circle cx="350" cy="350" r="320" fill="none" stroke="#ececec" stroke-width="22" />
+              <circle id="s7arc" cx="350" cy="350" r="320" fill="none" stroke="#10BE00" stroke-width="22" stroke-linecap="round" transform="rotate(-90 350 350)" stroke-dasharray="2011" stroke-dashoffset="2011" />
+            </svg>
+            <div class="son" id="s7son">$0</div>
+          </div>
+          <div id="zarralar"></div>
+          <div class="izoh" style="top: 1396px"><span class="w" data-at="19.3">noldan</span> <span class="w" data-at="19.5">→</span> <em class="w" data-at="20.0">daromadga</em></div>
+        </div>
+      </section>
+
+      <!-- 8. Qadamma-qadam (vertikal yo'l xaritasi) -->
+      <section class="sahna clip" id="s8" data-start="20.63" data-duration="2.1" data-track-index="1">
+        <div class="ich">
+          <div class="eyebrow w" data-at="20.66"><span class="nuqta"></span>Yo'l xaritasi</div>
+          <h2 class="sarlavha"><span class="w" data-at="20.7">Qadamma-</span><em class="w" data-at="21.2">qadam</em></h2>
+          <div id="qadamlar">
+            <div class="rels"><i id="relsI"></i></div>
+            <div class="qator" id="q1" style="top: 0"><div class="doira">1</div><div class="nom">Kontent</div></div>
+            <div class="qator" id="q2" style="top: 180px"><div class="doira">2</div><div class="nom">Progrev</div></div>
+            <div class="qator" id="q3" style="top: 360px"><div class="doira">3</div><div class="nom">Qimmat sotish</div></div>
+            <div class="qator" id="q4" style="top: 540px"><div class="doira">4</div><div class="nom">$3 000 <em>daromad</em></div></div>
+          </div>
+          <div class="izoh" style="top: 1378px; text-align: left; left: 120px"><em class="w" data-at="21.75" style="font-size: 92px">o'rganasiz</em></div>
+        </div>
+      </section>
+
+      <!-- 9. CTA -->
+      <section class="sahna clip" id="s9" data-start="22.73" data-duration="2.63" data-track-index="1">
+        <div class="ich">
+          <div class="eyebrow w" data-at="22.76"><span class="nuqta"></span>Ro'yxatdan o'tish</div>
+          <h2 class="sarlavha"><span class="w" data-at="22.73">Joyingizni</span> <span class="w" data-at="22.94">band</span> <span class="w" data-at="23.08">qiling</span></h2>
+          <div class="glow" id="s9glow" style="left: 40px; top: 620px; width: 1000px; height: 1000px"></div>
+          <div class="izoh" style="top: 760px"><em class="w" data-at="23.8" style="font-size: 170px; color: var(--yashil-tuq)">hoziroq</em></div>
+          <div id="tugmaTashqi">
+            <div id="tugma"><div class="yaltir" id="yaltir"></div>Ro'yxatdan o'ting<span class="strelka">→</span></div>
+            <svg class="ellips" viewBox="0 0 1000 350" preserveAspectRatio="none">
+              <ellipse id="ellips" cx="500" cy="175" rx="490" ry="165" fill="none" stroke="#10BE00" stroke-width="6" stroke-linecap="round" stroke-dasharray="2400" stroke-dashoffset="2400" transform="rotate(-2 500 175)" />
+            </svg>
+          </div>
+          <div id="toshqin"></div>
+          <svg id="kursor" viewBox="0 0 90 110"><path d="M8 6 L8 86 L28 68 L42 100 L58 93 L44 62 L72 62 Z" fill="#0B0B0B" stroke="#fff" stroke-width="5" stroke-linejoin="round" /></svg>
+        </div>
+      </section>
+
+      <!-- yuz: faqat 2-sahnada; ovoz butun video davomida -->
+      <div id="vfTashqi">
+        <div id="vfKarta">
+          <video id="aroll" class="clip" src="assets/video.mp4" playsinline data-has-audio="true" data-start="0" data-duration="25.36" data-track-index="0" data-volume="1"></video>
+          <div class="rec"><i></i>LIVE</div>
+        </div>
+        <div class="qavs tl"></div>
+        <div class="qavs tr"></div>
+        <div class="qavs bl"></div>
+        <div class="qavs br"></div>
+        <div class="kartochka" id="lt" style="position: absolute; left: -40px; top: 760px; padding: 26px 40px; border-radius: 30px; font-size: 46px; letter-spacing: -0.035em; white-space: nowrap">har bir progrev <em>loyiham</em></div>
+      </div>
+
+      <div class="grain"><svg><filter id="gf"><feTurbulence type="fractalNoise" baseFrequency="0.85" numOctaves="2" stitchTiles="stitch" seed="7" /><feColorMatrix type="saturate" values="0" /></filter><rect width="100%" height="100%" filter="url(#gf)" /></svg></div>
+      <div class="vinyetka"></div>
+
+      <!-- musiqa -->
+      <audio id="musiqa" data-timeline-role="music" src="assets/musiqa.mp3" data-start="0" data-duration="25.36" data-media-start="22.88" data-track-index="2" data-volume="0.05" data-automation='{"version":1,"lanes":[{"target":"volume","points":[{"t":0,"v":0},{"t":0.6,"v":0.05},{"t":24.2,"v":0.05},{"t":25.36,"v":0}]}]}'></audio>
+      <!-- SFX -->
+      <audio id="sfx01" src="assets/sfx/whoosh_pop.mp3" data-start="0.06" data-duration="0.18" data-track-index="3" data-volume="0.35"></audio>
+      <audio id="sfx02" src="assets/sfx/sweep.mp3" data-start="0.35" data-duration="0.78" data-track-index="4" data-volume="0.25"></audio>
+      <audio id="sfx03" src="assets/sfx/click.mp3" data-start="1.0" data-duration="1.10" data-track-index="5" data-volume="0.18"></audio>
+      <audio id="sfx04" src="assets/sfx/click.mp3" data-start="1.3" data-duration="1.10" data-track-index="6" data-volume="0.18"></audio>
+      <audio id="sfx05" src="assets/sfx/click.mp3" data-start="1.6" data-duration="1.10" data-track-index="7" data-volume="0.18"></audio>
+      <audio id="sfx06" src="assets/sfx/tanga.mp3" data-start="1.95" data-duration="1.02" data-track-index="8" data-volume="0.3"></audio>
+      <audio id="sfx07" src="assets/sfx/pop_quruq.mp3" data-start="2.48" data-duration="0.30" data-track-index="9" data-volume="0.3"></audio>
+      <audio id="sfx08" src="assets/sfx/whoosh_pop.mp3" data-start="2.8" data-duration="0.18" data-track-index="3" data-volume="0.3"></audio>
+      <audio id="sfx09" src="assets/sfx/whoosh_tez.mp3" data-start="3.22" data-duration="1.60" data-track-index="4" data-volume="0.3"></audio>
+      <audio id="sfx10" src="assets/sfx/sweep.mp3" data-start="3.36" data-duration="0.78" data-track-index="5" data-volume="0.28"></audio>
+      <audio id="sfx11" src="assets/sfx/pop.mp3" data-start="3.55" data-duration="0.38" data-track-index="6" data-volume="0.3"></audio>
+      <audio id="sfx12" src="assets/sfx/sehr.mp3" data-start="4.0" data-duration="1.60" data-track-index="7" data-volume="0.18"></audio>
+      <audio id="sfx13" src="assets/sfx/whoosh_pop.mp3" data-start="4.22" data-duration="0.18" data-track-index="8" data-volume="0.3"></audio>
+      <audio id="sfx14" src="assets/sfx/whoosh_tez.mp3" data-start="5.35" data-duration="1.60" data-track-index="9" data-volume="0.3"></audio>
+      <audio id="sfx15" src="assets/sfx/pop_quruq.mp3" data-start="5.62" data-duration="0.30" data-track-index="3" data-volume="0.35"></audio>
+      <audio id="sfx16" src="assets/sfx/sweep.mp3" data-start="5.98" data-duration="0.78" data-track-index="4" data-volume="0.22"></audio>
+      <audio id="sfx17" src="assets/sfx/whoosh_pop.mp3" data-start="6.22" data-duration="0.18" data-track-index="5" data-volume="0.32"></audio>
+      <audio id="sfx18" src="assets/sfx/zarba.mp3" data-start="6.88" data-duration="1.60" data-track-index="6" data-volume="0.3"></audio>
+      <audio id="sfx19" src="assets/sfx/ding.mp3" data-start="7.24" data-duration="1.60" data-track-index="7" data-volume="0.2"></audio>
+      <audio id="sfx20" src="assets/sfx/whoosh_pop.mp3" data-start="7.5" data-duration="0.18" data-track-index="8" data-volume="0.28"></audio>
+      <audio id="sfx21" src="assets/sfx/whoosh_tez.mp3" data-start="8.12" data-duration="1.60" data-track-index="9" data-volume="0.3"></audio>
+      <audio id="sfx22" src="assets/sfx/yozish.mp3" data-start="8.4" data-duration="1.00" data-track-index="3" data-volume="0.22"></audio>
+      <audio id="sfx23" src="assets/sfx/sehr.mp3" data-start="10.0" data-duration="1.60" data-track-index="4" data-volume="0.2"></audio>
+      <audio id="sfx24" src="assets/sfx/whoosh_tez.mp3" data-start="10.75" data-duration="1.60" data-track-index="5" data-volume="0.3"></audio>
+      <audio id="sfx25" src="assets/sfx/sweep.mp3" data-start="10.9" data-duration="0.78" data-track-index="6" data-volume="0.25"></audio>
+      <audio id="sfx26" src="assets/sfx/click.mp3" data-start="11.3" data-duration="1.10" data-track-index="7" data-volume="0.3"></audio>
+      <audio id="sfx27" src="assets/sfx/click.mp3" data-start="11.9" data-duration="1.10" data-track-index="8" data-volume="0.3"></audio>
+      <audio id="sfx28" src="assets/sfx/click.mp3" data-start="12.7" data-duration="1.10" data-track-index="9" data-volume="0.3"></audio>
+      <audio id="sfx29" src="assets/sfx/whoosh_tez.mp3" data-start="12.92" data-duration="1.60" data-track-index="3" data-volume="0.3"></audio>
+      <audio id="sfx30" src="assets/sfx/pop.mp3" data-start="13.5" data-duration="0.38" data-track-index="4" data-volume="0.32"></audio>
+      <audio id="sfx31" src="assets/sfx/sweep.mp3" data-start="13.75" data-duration="0.78" data-track-index="5" data-volume="0.18"></audio>
+      <audio id="sfx32" src="assets/sfx/pop_quruq.mp3" data-start="13.95" data-duration="0.30" data-track-index="6" data-volume="0.4"></audio>
+      <audio id="sfx33" src="assets/sfx/sweep.mp3" data-start="15.33" data-duration="0.78" data-track-index="7" data-volume="0.18"></audio>
+      <audio id="sfx34" src="assets/sfx/pop_quruq.mp3" data-start="15.53" data-duration="0.30" data-track-index="8" data-volume="0.4"></audio>
+      <audio id="sfx35" src="assets/sfx/sweep.mp3" data-start="16.02" data-duration="0.78" data-track-index="9" data-volume="0.18"></audio>
+      <audio id="sfx36" src="assets/sfx/pop_quruq.mp3" data-start="16.22" data-duration="0.30" data-track-index="3" data-volume="0.4"></audio>
+      <audio id="sfx37" src="assets/sfx/whoosh_tez.mp3" data-start="17.23" data-duration="1.60" data-track-index="4" data-volume="0.3"></audio>
+      <audio id="sfx38" src="assets/sfx/sweep.mp3" data-start="17.75" data-duration="0.78" data-track-index="5" data-volume="0.25"></audio>
+      <audio id="sfx39" src="assets/sfx/tanga.mp3" data-start="20.0" data-duration="1.02" data-track-index="6" data-volume="0.32"></audio>
+      <audio id="sfx40" src="assets/sfx/pop.mp3" data-start="20.02" data-duration="0.38" data-track-index="7" data-volume="0.3"></audio>
+      <audio id="sfx41" src="assets/sfx/whoosh_tez.mp3" data-start="20.43" data-duration="1.60" data-track-index="8" data-volume="0.3"></audio>
+      <audio id="sfx42" src="assets/sfx/pop_quruq.mp3" data-start="20.82" data-duration="0.30" data-track-index="9" data-volume="0.3"></audio>
+      <audio id="sfx43" src="assets/sfx/pop_quruq.mp3" data-start="21.1" data-duration="0.30" data-track-index="3" data-volume="0.3"></audio>
+      <audio id="sfx44" src="assets/sfx/pop_quruq.mp3" data-start="21.38" data-duration="0.30" data-track-index="4" data-volume="0.3"></audio>
+      <audio id="sfx45" src="assets/sfx/pop_quruq.mp3" data-start="21.66" data-duration="0.30" data-track-index="5" data-volume="0.3"></audio>
+      <audio id="sfx46" src="assets/sfx/whoosh_tez.mp3" data-start="22.53" data-duration="1.60" data-track-index="6" data-volume="0.3"></audio>
+      <audio id="sfx47" src="assets/sfx/whoosh_pop.mp3" data-start="23.12" data-duration="0.18" data-track-index="7" data-volume="0.32"></audio>
+      <audio id="sfx48" src="assets/sfx/sehr.mp3" data-start="23.55" data-duration="1.60" data-track-index="8" data-volume="0.18"></audio>
+      <audio id="sfx49" src="assets/sfx/sweep.mp3" data-start="23.85" data-duration="0.78" data-track-index="9" data-volume="0.22"></audio>
+      <audio id="sfx50" src="assets/sfx/tugma.mp3" data-start="24.5" data-duration="0.46" data-track-index="3" data-volume="0.32"></audio>
+      <audio id="sfx51" src="assets/sfx/ding.mp3" data-start="24.56" data-duration="0.78" data-track-index="4" data-volume="0.18"></audio>
+    </div>
+
+    <script>
+      const tl = gsap.timeline({ paused: true });
+      const B = (px) => `blur(${px}px)`;
+      const D = 25.36;
+
+      // ---------- fon: sekin aylanish (parallaks: fon sekin, oldingi qatlam tezroq) ----------
+      tl.fromTo("#yoyA", { rotation: 0 }, { rotation: 38, duration: D, ease: "none" }, 0);
+      tl.fromTo("#yoyB", { rotation: 0 }, { rotation: -30, duration: D, ease: "none" }, 0);
+      tl.fromTo("#halqaA", { rotation: 0, scale: 1 }, { rotation: 18, scale: 1.06, duration: D, ease: "none" }, 0);
+      tl.fromTo("#halqaB", { rotation: 0, scale: 1 }, { rotation: -18, scale: 1.08, duration: D, ease: "none" }, 0);
+      tl.fromTo("#nur", { x: -120, y: 0, scale: 0.9 }, { x: 120, y: 120, scale: 1.1, duration: D, ease: "sine.inOut" }, 0);
+      document.querySelectorAll(".fonraqam").forEach((el) => {
+        const s = el.closest(".sahna");
+        const a = parseFloat(s.dataset.start), d = parseFloat(s.dataset.duration);
+        tl.fromTo(el, { x: 60, opacity: 0 }, { x: -60, opacity: 1, duration: d, ease: "none" }, a);
+      });
+
+      // ---------- so'zma-so'z: blur'dan aniqlashadi ----------
+      document.querySelectorAll(".w[data-at]").forEach((el) => {
+        const t = parseFloat(el.dataset.at);
+        tl.fromTo(el, { opacity: 0, filter: B(14), y: 18 }, { opacity: 1, filter: B(0), y: 0, duration: 0.42, ease: "expo.out" }, t);
+      });
+
+      // ---------- sahna chiqishlari (har biri o'zgacha, kirishdan tezroq) ----------
+      const chiq = {
+        s1: [{ x: -140, opacity: 0, filter: B(16) }, 0.2, "power3.in"],
+        s3: [{ scale: 0.94, opacity: 0, filter: B(18) }, 0.2, "power2.in"],
+        s4: [{ opacity: 0 }, 0.06, "none"],
+        s5: [{ scale: 1.25, opacity: 0, filter: B(20) }, 0.24, "power2.in"],
+        s6: [{ y: -120, opacity: 0, filter: B(14) }, 0.2, "power3.in"],
+        s7: [{ x: -160, opacity: 0, filter: B(16) }, 0.2, "power3.in"],
+        s8: [{ x: 160, opacity: 0, filter: B(16) }, 0.2, "power3.in"],
+        s2: [{ opacity: 0, filter: B(12) }, 0.16, "power2.in"],
+      };
+      Object.entries(chiq).forEach(([id, [v, d, e]]) => {
+        const s = document.getElementById(id);
+        const end = parseFloat(s.dataset.start) + parseFloat(s.dataset.duration);
+        tl.to(`#${id} .ich`, { ...v, duration: d, ease: e }, end - d);
+      });
+
+      // ---------- glow nafas oladi ----------
+      ["#s1glow", "#s3glow", "#s7glow", "#s9glow"].forEach((g) => {
+        const s = document.querySelector(g).closest(".sahna");
+        const a = parseFloat(s.dataset.start), d = parseFloat(s.dataset.duration);
+        tl.fromTo(g, { opacity: 0, scale: 0.6 }, { opacity: 1, scale: 1, duration: 0.8, ease: "sine.out" }, a + 0.2);
+        tl.to(g, { scale: 1.08, duration: Math.max(0.6, d - 1.2), ease: "sine.inOut" }, a + 1.0);
+      });
+
+      // ---------- ring + sanoq ----------
+      function ring(t, arc, son, t0, t1, oxiri, ulush, matn) {
+        tl.fromTo(t, { opacity: 0, scale: 0.72, rotationX: 55, transformPerspective: 1600, filter: B(10) },
+          { opacity: 1, scale: 1, rotationX: 0, filter: B(0), duration: 0.7, ease: "expo.out" }, t0);
+        tl.to(arc, { attr: { "stroke-dashoffset": 2011 * (1 - ulush) }, duration: t1 - t0, ease: "power2.inOut" }, t0 + 0.1);
+        const v = { n: 0 };
+        const el = document.querySelector(son);
+        tl.to(v, {
+          n: oxiri, duration: t1 - t0, ease: "power2.inOut",
+          onUpdate: () => {
+            const r = Math.round(v.n / 10) * 10;
+            el.textContent = r >= oxiri ? matn : "$" + String(r).replace(/\B(?=(\d{3})+$)/g, " ");
+          },
+        }, t0 + 0.1);
+      }
+      ring("#s1ringT", "#s1arc", "#s1son", 0.35, 1.95, 500, 0.25, "$500");
+      // 500 da tiqilib qoladi: halqa o'tolmay silkinadi
+      tl.to("#s1arc", { attr: { "stroke-dashoffset": 2011 * 0.69 }, duration: 0.16, ease: "power2.out", yoyo: true, repeat: 1 }, 2.48);
+      tl.fromTo("#s1son", { x: 0 }, { x: 14, duration: 0.05, ease: "none", yoyo: true, repeat: 5 }, 2.5);
+      ring("#s7ringT", "#s7arc", "#s7son", 17.75, 20.0, 3000, 1, "$3 000");
+      tl.fromTo("#s7son", { scale: 1 }, { scale: 1.1, duration: 0.18, ease: "back.out(3)", yoyo: true, repeat: 1 }, 20.0);
+
+      // 7-sahna: $3 000 da zarrachalar (deterministik burchaklar)
+      const zr = document.getElementById("zarralar");
+      for (let i = 0; i < 8; i++) {
+        const z = document.createElement("div");
+        z.className = "zarra";
+        z.textContent = "$";
+        z.style.left = "540px";
+        z.style.top = "1020px";
+        zr.appendChild(z);
+        const a = (i / 8) * Math.PI * 2 + 0.3;
+        const r = 400 + (i % 3) * 40;
+        tl.fromTo(z, { x: 0, y: 0, scale: 0.3, opacity: 0 },
+          { x: Math.cos(a) * r, y: Math.sin(a) * r * 0.62, scale: 1, opacity: 1, duration: 0.6, ease: "expo.out" }, 20.0 + i * 0.015);
+        tl.to(z, { y: Math.sin(a) * r * 0.62 - (40 + (i % 4) * 12), opacity: 0, duration: 0.5, ease: "sine.in" }, 20.6);
+      }
+
+      // ---------- 2-sahna: yuz kartochkasi (3D egilib kiradi, sekin aylanib turadi) ----------
+      tl.set("#vfTashqi", { transformPerspective: 1800 }, 0);
+      tl.fromTo("#vfTashqi", { opacity: 0, x: 520, rotationY: -28, scale: 0.9 },
+        { opacity: 1, x: 0, rotationY: -6, scale: 1, duration: 0.5, ease: "expo.out" }, 3.36);
+      tl.to("#vfTashqi", { rotationY: 5, scale: 1.03, duration: 1.5, ease: "sine.inOut" }, 3.86);
+      tl.fromTo("#vfTashqi .qavs", { scale: 1.35, opacity: 0 }, { scale: 1, opacity: 1, duration: 0.36, stagger: 0.06, ease: "back.out(2.4)" }, 3.55);
+      tl.fromTo("#lt", { opacity: 0, x: -80, filter: B(10) }, { opacity: 1, x: 0, filter: B(0), duration: 0.4, ease: "expo.out" }, 4.22);
+      tl.to("#vfTashqi", { opacity: 0, x: -700, rotationY: 24, duration: 0.22, ease: "power3.in" }, 5.37);
+
+      // ---------- 3-sahna: narx zinapoyasi ----------
+      tl.fromTo("#n500", { opacity: 0, scale: 0.9, filter: B(10) }, { opacity: 1, scale: 1, filter: B(0), duration: 0.45, ease: "expo.out" }, 5.62);
+      tl.fromTo("#n500chiz", { scaleX: 0 }, { scaleX: 1, duration: 0.3, ease: "power2.inOut" }, 5.98);
+      tl.fromTo("#n1500", { opacity: 0, x: 260, rotationY: -30, transformPerspective: 1600 }, { opacity: 1, x: 0, rotationY: 0, duration: 0.5, ease: "expo.out" }, 6.22);
+      tl.fromTo("#n2000", { opacity: 0, y: -260, scale: 1.25 }, { opacity: 1, y: 0, scale: 1, duration: 0.34, ease: "back.out(1.5)" }, 6.88);
+      tl.to(["#n500", "#n1500"], { opacity: 0.45, duration: 0.3, ease: "sine.out" }, 7.0);
+      tl.to("#n2000", { scale: 1.05, duration: 0.2, ease: "power2.out", yoyo: true, repeat: 1 }, 7.24);
+
+      // ---------- 4-sahna: typewriter + kursor ----------
+      document.querySelectorAll("[data-type]").forEach((el) => {
+        const t = parseFloat(el.dataset.type), step = parseFloat(el.dataset.step);
+        const sozlar = el.textContent.split(" ");
+        el.textContent = "";
+        const spans = [];
+        // harflar so'z ichida guruhlanadi — qator so'z o'rtasidan bo'linmaydi
+        sozlar.forEach((soz, i) => {
+          const w = document.createElement("span");
+          w.className = "soz";
+          [...soz].forEach((c) => {
+            const h = document.createElement("span");
+            h.className = "h";
+            h.textContent = c;
+            w.appendChild(h);
+            spans.push(h);
+          });
+          el.appendChild(w);
+          if (i < sozlar.length - 1) el.appendChild(document.createTextNode(" "));
+        });
+        tl.fromTo(spans, { opacity: 0, filter: B(10), y: 10 }, { opacity: 1, filter: B(0), y: 0, duration: 0.2, stagger: step, ease: "power2.out" }, t);
+        el._spans = spans;
+        el._t = t;
+        el._step = step;
+      });
+      // kursor: birinchi gap oxirida, yozib bo'lingach miltillaydi
+      const kur = document.getElementById("s4kursor");
+      document.getElementById("s4yoz").appendChild(kur);
+      tl.fromTo(kur, { opacity: 0 }, { opacity: 1, duration: 0.05 }, 9.3);
+      tl.to(kur, { opacity: 0, duration: 0.05, yoyo: true, repeat: 3, repeatDelay: 0.2 }, 9.45);
+      tl.set(kur, { opacity: 0 }, 9.95);
+      tl.to("#s4yoz", { color: "#B5B5B5", y: -30, duration: 0.4, ease: "expo.out" }, 9.95);
+      tl.fromTo("#s4fon", { rotation: -8 }, { rotation: 6, duration: 2.55, ease: "none" }, 8.32);
+
+      // ---------- 5-sahna: 3D soat, kamera itariladi ----------
+      const bg = document.getElementById("belgilar");
+      for (let i = 0; i < 60; i++) {
+        const a = (i / 60) * Math.PI * 2;
+        const katta = i % 5 === 0;
+        const r1 = katta ? 300 : 316, r2 = 334;
+        const l = document.createElementNS("http://www.w3.org/2000/svg", "line");
+        l.setAttribute("x1", 400 + Math.sin(a) * r1);
+        l.setAttribute("y1", 400 - Math.cos(a) * r1);
+        l.setAttribute("x2", 400 + Math.sin(a) * r2);
+        l.setAttribute("y2", 400 - Math.cos(a) * r2);
+        l.setAttribute("stroke", katta ? "#0B0B0B" : "#C9C9C9");
+        l.setAttribute("stroke-width", katta ? 8 : 3);
+        bg.appendChild(l);
+      }
+      tl.fromTo("#soatSahna", { opacity: 0, scale: 0.7, rotationX: 38, rotationY: -26, transformPerspective: 1800, filter: B(12) },
+        { opacity: 1, scale: 0.95, rotationX: 18, rotationY: -12, filter: B(0), duration: 0.6, ease: "expo.out" }, 10.9);
+      tl.to("#soatSahna", { scale: 1.06, rotationX: 6, rotationY: 4, duration: 1.66, ease: "sine.inOut" }, 11.5);
+      tl.to("#soatYoy", { attr: { "stroke-dashoffset": 2212 * 0.25 }, duration: 1.9, ease: "power1.inOut" }, 11.0);
+      [11.3, 11.9, 12.7].forEach((t, i) => {
+        tl.to("#soatUg", { rotation: 72 * (i + 1), svgOrigin: "400 400", duration: 0.14, ease: "back.out(2.6)" }, t);
+      });
+      tl.fromTo("#soatK", { rotation: -70 }, { rotation: -46, svgOrigin: "400 400", duration: 2.2, ease: "none" }, 10.95);
+
+      // ---------- 6-sahna: konstellatsiya ----------
+      tl.fromTo("#hub", { opacity: 0, scale: 0.4 }, { opacity: 1, scale: 1, duration: 0.5, ease: "back.out(2)" }, 13.5);
+      tl.fromTo("#hubHalqa", { scale: 0.8, opacity: 1 }, { scale: 1.5, opacity: 0, duration: 1.2, ease: "sine.out", repeat: 2 }, 13.6);
+      [["#hx1", "#l1", "#t1", 13.95], ["#hx2", "#l2", "#t2", 15.53], ["#hx3", "#l3", "#t3", 16.22]].forEach(([h, l, tg, t]) => {
+        tl.to(l, { attr: { "stroke-dashoffset": 0 }, duration: 0.25, ease: "power2.out" }, t - 0.2);
+        tl.fromTo(h + " .ich6", { opacity: 0, scale: 0.4, rotation: -25 }, { opacity: 1, scale: 1, rotation: 0, duration: 0.42, ease: "back.out(2.2)" }, t);
+        tl.fromTo(tg, { opacity: 0, y: 20, filter: B(10) }, { opacity: 1, y: 0, filter: B(0), duration: 0.35, ease: "expo.out" }, t + 0.18);
+        tl.to(h, { y: -14, duration: 1.1, ease: "sine.inOut", yoyo: true, repeat: Math.max(0, Math.floor((17.2 - t - 0.5) / 1.1) - 1) }, t + 0.5);
+      });
+
+      // ---------- 8-sahna: vertikal yo'l xaritasi ----------
+      tl.fromTo("#relsI", { scaleY: 0 }, { scaleY: 1, duration: 0.95, ease: "power2.inOut" }, 20.85);
+      ["#q1", "#q2", "#q3", "#q4"].forEach((id, i) => {
+        tl.fromTo(id, { opacity: 0, x: -90, filter: B(10) }, { opacity: 1, x: 0, filter: B(0), duration: 0.42, ease: "expo.out" }, 20.82 + i * 0.28);
+        tl.fromTo(id + " .doira", { scale: 0.5 }, { scale: 1, duration: 0.4, ease: "back.out(2.4)" }, 20.82 + i * 0.28);
+      });
+
+      // ---------- 9-sahna: CTA ----------
+      tl.fromTo("#tugmaTashqi", { opacity: 0, y: 90, scale: 0.92, filter: B(14) }, { opacity: 1, y: 0, scale: 1, filter: B(0), duration: 0.55, ease: "expo.out" }, 23.12);
+      tl.fromTo("#yaltir", { x: -260, skewX: -18 }, { x: 1000, skewX: -18, duration: 0.7, ease: "power2.inOut" }, 23.55);
+      tl.fromTo("#kursor", { opacity: 0, x: 260, y: 220 }, { opacity: 1, x: 0, y: 0, duration: 0.6, ease: "expo.out" }, 23.85);
+      tl.to("#kursor", { scale: 0.86, duration: 0.08, ease: "power2.in", yoyo: true, repeat: 1, transformOrigin: "10% 10%" }, 24.5);
+      tl.to("#tugma", { scale: 0.96, duration: 0.08, ease: "power2.in", yoyo: true, repeat: 1 }, 24.5);
+      tl.fromTo("#toshqin", { scale: 0.2, opacity: 0.9 }, { scale: 1.6, opacity: 0, duration: 0.6, ease: "expo.out" }, 24.56);
+      tl.to("#ellips", { attr: { "stroke-dashoffset": 0 }, duration: 0.6, ease: "power2.inOut" }, 24.5);
+      tl.fromTo("#yaltir", { x: -260 }, { x: 1000, duration: 0.6, ease: "power2.inOut", immediateRender: false }, 24.7);
+
+      window.__timelines["main"] = tl;
+    </script>
+  </body>
+</html>
